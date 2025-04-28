@@ -1,0 +1,23 @@
+# Example .bitignore file
+
+# Ignore log files
+*.log
+
+# Ignore build directories
+build/
+dist/
+
+# Ignore node modules
+node_modules/
+
+# Ignore specific files
+.env
+.DS_Store
+
+# Ignore temporary files
+*.tmp
+*.swp
+*~
+
+# Ignore all files in a specific directory
+tmp/** 
