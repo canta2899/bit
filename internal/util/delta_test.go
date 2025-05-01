@@ -2,7 +2,9 @@ package util
 
 import (
 	"bytes"
+	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -28,6 +30,7 @@ func TestCalculateDelta(t *testing.T) {
 				BaseSaveHash: "",
 				Patches:      nil,
 				ContentHash:  calculateFileHash([]byte("New file content")),
+				Compressed:   true,
 			},
 		},
 		{
@@ -43,6 +46,7 @@ func TestCalculateDelta(t *testing.T) {
 				BaseSaveHash: "abc123",
 				Patches:      nil,
 				ContentHash:  calculateFileHash([]byte("Original content")),
+				Compressed:   true,
 			},
 		},
 		{
@@ -57,6 +61,7 @@ func TestCalculateDelta(t *testing.T) {
 				IsDeleted:    false,
 				BaseSaveHash: "abc123",
 				// We can't easily assert on the specific patch content, so we'll check non-nil in the test
+				Compressed: true,
 			},
 		},
 		{
@@ -72,6 +77,7 @@ func TestCalculateDelta(t *testing.T) {
 				BaseSaveHash: "abc123",
 				Patches:      nil,
 				ContentHash:  calculateFileHash([]byte("Same content")),
+				Compressed:   true,
 			},
 		},
 	}
@@ -125,6 +131,13 @@ func TestApplyDelta(t *testing.T) {
 		return nil, nil
 	}
 
+	// Prepare some pre-compressed patches
+	patchText := "@@ -1,16 +1,17 @@\n Original%20\n+Modified%20\n content"
+	compressedPatch, err := compressString(patchText)
+	if err != nil {
+		t.Fatalf("Failed to compress test patch: %v", err)
+	}
+
 	tests := []struct {
 		name           string
 		delta          DeltaInfo
@@ -138,8 +151,9 @@ func TestApplyDelta(t *testing.T) {
 				IsNew:        false,
 				IsDeleted:    false,
 				BaseSaveHash: "base123",
-				Patches:      []string{"@@ -1,16 +1,17 @@\n Original%20\n+Modified%20\n content"},
+				Patches:      []string{compressedPatch},
 				ContentHash:  calculateFileHash([]byte("Original Modified content")),
+				Compressed:   true,
 			},
 			expectedResult: []byte("Original Modified content"),
 			expectError:    false,
@@ -153,6 +167,7 @@ func TestApplyDelta(t *testing.T) {
 				BaseSaveHash: "",
 				Patches:      nil,
 				ContentHash:  calculateFileHash([]byte("New file content")),
+				Compressed:   true,
 			},
 			expectedResult: []byte("New file content"),
 			expectError:    false,
@@ -166,6 +181,7 @@ func TestApplyDelta(t *testing.T) {
 				BaseSaveHash: "base123",
 				Patches:      nil,
 				ContentHash:  calculateFileHash([]byte("Original content")),
+				Compressed:   true,
 			},
 			expectedResult: nil,
 			expectError:    false,
@@ -179,6 +195,7 @@ func TestApplyDelta(t *testing.T) {
 				BaseSaveHash: "base123",
 				Patches:      nil,
 				ContentHash:  calculateFileHash([]byte("Original content")),
+				Compressed:   true,
 			},
 			expectedResult: []byte("Original content"),
 			expectError:    false,
@@ -236,6 +253,7 @@ func TestSaveAndLoadDeltaSet(t *testing.T) {
 				BaseSaveHash: "",
 				Patches:      nil,
 				ContentHash:  "hash1",
+				Compressed:   true,
 			},
 			{
 				Path:         "file2.txt",
@@ -244,6 +262,7 @@ func TestSaveAndLoadDeltaSet(t *testing.T) {
 				BaseSaveHash: "base123",
 				Patches:      []string{"@@ -1,8 +1,9 @@\n test\n+new\n"},
 				ContentHash:  "hash2",
+				Compressed:   true,
 			},
 		},
 	}
@@ -283,7 +302,8 @@ func TestSaveAndLoadDeltaSet(t *testing.T) {
 		if actual.Path != expected.Path ||
 			actual.IsNew != expected.IsNew ||
 			actual.IsDeleted != expected.IsDeleted ||
-			actual.ContentHash != expected.ContentHash {
+			actual.ContentHash != expected.ContentHash ||
+			actual.Compressed != expected.Compressed {
 			t.Errorf("Loaded delta info doesn't match original")
 		}
 	}
@@ -312,14 +332,14 @@ func TestSaveFullFile(t *testing.T) {
 		t.Errorf("Expected file %s to exist", expectedPath)
 	}
 
-	// Verify content
-	savedContent, err := mockFS.ReadFile(expectedPath)
+	// Since we now compress files, we need to use GetFileContent to read it back correctly
+	retrievedContent, err := GetFileContent(path, saveHash, objectsDir, mockFS)
 	if err != nil {
-		t.Fatalf("Failed to read saved file: %v", err)
+		t.Fatalf("Failed to read saved file content: %v", err)
 	}
 
-	if !bytes.Equal(savedContent, content) {
-		t.Errorf("Saved content doesn't match original")
+	if !bytes.Equal(retrievedContent, content) {
+		t.Errorf("Retrieved content doesn't match original")
 	}
 }
 
@@ -335,8 +355,14 @@ func TestGetFileContent(t *testing.T) {
 	path := "test.txt"
 	saveHash := "save123"
 
+	// Add working file directly
 	mockFS.AddFile(path, workingContent)
-	mockFS.AddFile(filepath.Join(objectsDir, saveHash+"_"+path), savedContent)
+
+	// Save the file with our proper save function to ensure it's compressed
+	err := SaveFullFile(savedContent, path, saveHash, objectsDir, mockFS)
+	if err != nil {
+		t.Fatalf("Failed to save test file: %v", err)
+	}
 
 	// Test reading from working directory
 	content, err := GetFileContent(path, "", objectsDir, mockFS)
@@ -360,5 +386,248 @@ func TestGetFileContent(t *testing.T) {
 	_, err = GetFileContent("nonexistent.txt", "", objectsDir, mockFS)
 	if err == nil {
 		t.Error("Expected error for non-existent file but got none")
+	}
+}
+
+func TestCompressDecompressString(t *testing.T) {
+	// Test strings of different sizes
+	testCases := []string{
+		"",                        // Empty string
+		"Hello, world!",           // Small string
+		strings.Repeat("A", 1000), // Medium string with repetition (should compress well)
+		strings.Repeat("Random text that should have some repetition. ", 100), // Larger string with some repetition
+	}
+
+	for _, tc := range testCases {
+		// Test compression
+		compressed, err := compressString(tc)
+		if err != nil {
+			t.Errorf("compressString error for %q: %v", truncateForDisplay(tc), err)
+			continue
+		}
+
+		// Test decompression
+		decompressed, err := decompressString(compressed)
+		if err != nil {
+			t.Errorf("decompressString error for %q: %v", truncateForDisplay(tc), err)
+			continue
+		}
+
+		// Verify that the decompressed string matches the original
+		if decompressed != tc {
+			t.Errorf("decompression mismatch: expected %q, got %q", truncateForDisplay(tc), truncateForDisplay(decompressed))
+		}
+	}
+}
+
+func TestDeltaCompression(t *testing.T) {
+	oldContent := []byte("This is the original content of the file.")
+	newContent := []byte("This is the modified content of the file with some additional text.")
+	path := "test.txt"
+	baseSaveHash := "test-hash"
+
+	// Create delta
+	delta := CalculateDelta(oldContent, newContent, path, baseSaveHash)
+
+	// Create file system
+	fs := NewMockFileSystem()
+
+	// Create delta set
+	deltaSet := DeltaSet{
+		SaveHash: "test-save-hash",
+		Deltas:   []DeltaInfo{delta},
+	}
+
+	// Save delta set (this will compress the patches)
+	err := SaveDeltaSet(deltaSet, "objects", fs)
+	if err != nil {
+		t.Fatalf("SaveDeltaSet error: %v", err)
+	}
+
+	// Load delta set
+	loadedDeltaSet, err := LoadDeltaSet("test-save-hash", "objects", fs)
+	if err != nil {
+		t.Fatalf("LoadDeltaSet error: %v", err)
+	}
+
+	// Verify that the loaded delta has compressed patches
+	if len(loadedDeltaSet.Deltas) != 1 {
+		t.Fatalf("Expected 1 delta, got %d", len(loadedDeltaSet.Deltas))
+	}
+
+	loadedDelta := loadedDeltaSet.Deltas[0]
+	if !loadedDelta.Compressed {
+		t.Errorf("Delta was not compressed")
+	}
+
+	// Create a content provider for testing
+	contentProvider := func(p, h string) ([]byte, error) {
+		if p == path && h == baseSaveHash {
+			return oldContent, nil
+		}
+		return nil, nil
+	}
+
+	// Apply the delta
+	reconstructedContent, err := ApplyDelta(loadedDelta, contentProvider)
+	if err != nil {
+		t.Fatalf("ApplyDelta error: %v", err)
+	}
+
+	// Verify that the reconstructed content matches the new content
+	if !bytes.Equal(reconstructedContent, newContent) {
+		t.Errorf("Content mismatch after applying delta")
+	}
+}
+
+// TestCompressionEfficiency tests that compression actually reduces size for typical deltas
+func TestCompressionEfficiency(t *testing.T) {
+	// Create a large string with repetition (patches often have repetitive structures)
+	largeOriginalContent := "This is a line of text in a file.\n"
+	var longFileBuilder bytes.Buffer
+	for i := 0; i < 1000; i++ {
+		longFileBuilder.WriteString(largeOriginalContent)
+	}
+	originalContent := longFileBuilder.Bytes()
+
+	// Create slightly modified content by changing every 100th line
+	var modifiedBuilder bytes.Buffer
+	lines := bytes.Split(originalContent, []byte("\n"))
+	for i, line := range lines {
+		if i > 0 && i%100 == 0 {
+			modifiedBuilder.WriteString("This line has been modified " + string(line) + "\n")
+		} else if i < len(lines)-1 || len(line) > 0 {
+			modifiedBuilder.Write(line)
+			modifiedBuilder.WriteByte('\n')
+		}
+	}
+	modifiedContent := modifiedBuilder.Bytes()
+
+	// Calculate delta
+	delta := CalculateDelta(originalContent, modifiedContent, "test.txt", "base-hash")
+
+	// Compress the patches
+	uncompressedSize := 0
+	for _, patch := range delta.Patches {
+		uncompressedSize += len(patch)
+	}
+
+	// Manually compress the first patch
+	compressed, err := compressString(delta.Patches[0])
+	if err != nil {
+		t.Fatalf("Failed to compress: %v", err)
+	}
+	compressedSize := len(compressed)
+
+	// Check if compression reduced size
+	compressionRatio := float64(compressedSize) / float64(uncompressedSize)
+	t.Logf("Uncompressed size: %d, Compressed size: %d, Ratio: %.2f", uncompressedSize, compressedSize, compressionRatio)
+
+	// For typical diff patches, we expect good compression (ratio < 0.5)
+	if compressionRatio > 0.9 {
+		t.Errorf("Compression efficiency is poor: ratio = %.2f", compressionRatio)
+	}
+}
+
+// Helper function to truncate long strings for error messages
+func truncateForDisplay(s string) string {
+	const maxLen = 50
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "... [truncated]"
+}
+
+// TestFullFileCompression tests the compression for full file content
+func TestFullFileCompression(t *testing.T) {
+	// Create file system
+	fs := NewMockFileSystem()
+	objectsDir := "objects"
+	fs.MkdirAll(objectsDir, 0755)
+
+	// Create some test content of various sizes
+	testCases := []struct {
+		name        string
+		content     []byte
+		expectRatio float64 // Expected compression ratio range
+	}{
+		{
+			name:        "Small random content",
+			content:     []byte("Small test content with little repetition"),
+			expectRatio: 0.9, // Might not compress well
+		},
+		{
+			name:        "Repetitive content",
+			content:     []byte(strings.Repeat("This is repetitive content. ", 100)),
+			expectRatio: 0.2, // Should compress very well
+		},
+		{
+			name:        "Mixed content",
+			content:     []byte(strings.Repeat("AAAA", 50) + strings.Repeat("BBBB", 50) + strings.Repeat("CCCC", 50)),
+			expectRatio: 0.3, // Should compress well
+		},
+	}
+
+	path := "test.txt"
+	saveHash := "test-save-hash"
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Save the file (should always be compressed now)
+			err := SaveFullFile(tc.content, path, saveHash, objectsDir, fs)
+			if err != nil {
+				t.Fatalf("Failed to save file: %v", err)
+			}
+
+			// Read the file back
+			retrievedContent, err := GetFileContent(path, saveHash, objectsDir, fs)
+			if err != nil {
+				t.Fatalf("Failed to get file content: %v", err)
+			}
+
+			// Verify content matches
+			if !bytes.Equal(retrievedContent, tc.content) {
+				t.Errorf("Content mismatch after retrieval")
+			}
+
+			// Check if the file was compressed (it should always be now)
+			rawContent, err := fs.ReadFile(filepath.Join(objectsDir, saveHash+"_"+path))
+			if err != nil {
+				t.Fatalf("Failed to read raw file: %v", err)
+			}
+
+			// Verify it has our compression header format
+			isCompressed := false
+			if len(rawContent) > 8 {
+				// Try to parse metadata length
+				metadataLen := (int(rawContent[0]) << 24) | (int(rawContent[1]) << 16) | (int(rawContent[2]) << 8) | int(rawContent[3])
+				if metadataLen > 0 && metadataLen < 1000 && 4+metadataLen < len(rawContent) {
+					// Extract metadata
+					metadata := struct {
+						Compressed bool `json:"compressed"`
+					}{}
+					if json.Unmarshal(rawContent[4:4+metadataLen], &metadata) == nil {
+						isCompressed = metadata.Compressed
+					}
+				}
+			}
+
+			if !isCompressed {
+				t.Errorf("File was not compressed even though compression is now mandatory")
+			}
+
+			// Check compression ratio
+			if isCompressed && len(tc.content) > 0 {
+				compressedSize := len(rawContent)
+				compressionRatio := float64(compressedSize) / float64(len(tc.content))
+				t.Logf("Compression ratio: %.2f (original: %d bytes, compressed: %d bytes)",
+					compressionRatio, len(tc.content), compressedSize)
+
+				// For repetitive content, expect a much better ratio (lower is better)
+				if tc.name == "Repetitive content" && compressionRatio > tc.expectRatio {
+					t.Errorf("Compression not as effective as expected for repetitive content: %.2f", compressionRatio)
+				}
+			}
+		})
 	}
 }

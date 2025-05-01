@@ -10,6 +10,11 @@ import (
 )
 
 func main() {
+	// Always enable compression for all deltas
+	util.CompressionConfig.Enabled = true
+	util.CompressionConfig.MinSizeForCompression = 1     // Compress all deltas regardless of size
+	util.CompressionConfig.CompressNewFileContent = true // Also compress full file content
+
 	if len(os.Args) < 2 {
 		printUsage()
 		os.Exit(1)
