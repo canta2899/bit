@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -38,35 +37,45 @@ type Metadata struct {
 	Saves []Save `json:"saves"`
 }
 
+// Repository defines methods for interacting with a bit repository
+type Repository struct {
+	fs util.FileSystem
+}
+
+// NewRepository creates a new repository with the provided filesystem
+func NewRepository(fs util.FileSystem) *Repository {
+	return &Repository{fs: fs}
+}
+
 // InitRepository initializes a new bit repository
-func InitRepository() error {
+func (r *Repository) InitRepository() error {
 	// Check if .bit directory already exists
-	if _, err := os.Stat(bitDir); !os.IsNotExist(err) {
+	if _, err := r.fs.Stat(bitDir); !os.IsNotExist(err) {
 		return fmt.Errorf("repository already initialized")
 	}
 
 	// Create directory structure
 	dirs := []string{bitDir, objectsDir}
 	for _, dir := range dirs {
-		if err := os.MkdirAll(dir, 0755); err != nil {
+		if err := r.fs.MkdirAll(dir, 0755); err != nil {
 			return fmt.Errorf("failed to create directory %s: %w", dir, err)
 		}
 	}
 
 	// Initialize empty metadata file
 	metadata := Metadata{Saves: []Save{}}
-	return saveMetadata(metadata)
+	return r.saveMetadata(metadata)
 }
 
 // SaveState creates a snapshot of the current state with the given name
-func SaveState(name string) (string, error) {
+func (r *Repository) SaveState(name string) (string, error) {
 	// Check if repository is initialized
-	if _, err := os.Stat(bitDir); os.IsNotExist(err) {
+	if _, err := r.fs.Stat(bitDir); os.IsNotExist(err) {
 		return "", fmt.Errorf("repository not initialized, run 'bit init' first")
 	}
 
 	// Get list of files to save (already excludes ignored files except .bitignore)
-	files, err := getFilesToSave()
+	files, err := r.getFilesToSave()
 	if err != nil {
 		return "", fmt.Errorf("failed to get files to save: %w", err)
 	}
@@ -80,7 +89,7 @@ func SaveState(name string) (string, error) {
 	hash := createSaveHash(name, timestamp, files)
 
 	// Load existing metadata to find the previous save
-	metadata, err := loadMetadata()
+	metadata, err := r.loadMetadata()
 	if err != nil {
 		return "", fmt.Errorf("failed to load metadata: %w", err)
 	}
@@ -97,7 +106,7 @@ func SaveState(name string) (string, error) {
 
 	if deltaMode {
 		// Use delta-based storage
-		err = saveFilesAsDelta(files, hash, baseSave)
+		err = r.saveFilesAsDelta(files, hash, baseSave)
 		if err != nil {
 			return "", fmt.Errorf("failed to save files as delta: %w", err)
 		}
@@ -107,11 +116,11 @@ func SaveState(name string) (string, error) {
 			targetPath := filepath.Join(objectsDir, hash+"_"+file)
 			targetDir := filepath.Dir(targetPath)
 
-			if err := os.MkdirAll(targetDir, 0755); err != nil {
+			if err := r.fs.MkdirAll(targetDir, 0755); err != nil {
 				return "", fmt.Errorf("failed to create directory %s: %w", targetDir, err)
 			}
 
-			if err := copyFile(file, targetPath); err != nil {
+			if err := r.copyFile(file, targetPath); err != nil {
 				return "", fmt.Errorf("failed to copy file %s: %w", file, err)
 			}
 		}
@@ -127,7 +136,7 @@ func SaveState(name string) (string, error) {
 	}
 
 	metadata.Saves = append(metadata.Saves, save)
-	if err := saveMetadata(metadata); err != nil {
+	if err := r.saveMetadata(metadata); err != nil {
 		return "", fmt.Errorf("failed to save metadata: %w", err)
 	}
 
@@ -135,7 +144,7 @@ func SaveState(name string) (string, error) {
 }
 
 // saveFilesAsDelta saves files using delta-based storage
-func saveFilesAsDelta(files []string, saveHash string, baseSave *Save) error {
+func (r *Repository) saveFilesAsDelta(files []string, saveHash string, baseSave *Save) error {
 	var deltas []util.DeltaInfo
 	var baseFileMap map[string]bool
 	deltaCounts := make(map[string]int) // Track delta chain length for each file
@@ -148,7 +157,7 @@ func saveFilesAsDelta(files []string, saveHash string, baseSave *Save) error {
 		}
 
 		// Calculate delta chain lengths from metadata
-		metadata, err := loadMetadata()
+		metadata, err := r.loadMetadata()
 		if err == nil {
 			// Build a map of save hash to index for quick lookup
 			saveMap := make(map[string]int, len(metadata.Saves))
@@ -172,7 +181,7 @@ func saveFilesAsDelta(files []string, saveHash string, baseSave *Save) error {
 
 					// Check if this save has a full file content stored
 					fullPath := filepath.Join(objectsDir, currentHash+"_"+file)
-					if _, err := os.Stat(fullPath); err == nil {
+					if _, err := r.fs.Stat(fullPath); err == nil {
 						// Full file found, chain ends here
 						break
 					}
@@ -190,7 +199,7 @@ func saveFilesAsDelta(files []string, saveHash string, baseSave *Save) error {
 	// Process each file in the current state
 	for _, file := range files {
 		// Read current file content
-		currentContent, err := os.ReadFile(file)
+		currentContent, err := r.fs.ReadFile(file)
 		if err != nil {
 			return fmt.Errorf("failed to read file %s: %w", file, err)
 		}
@@ -198,7 +207,7 @@ func saveFilesAsDelta(files []string, saveHash string, baseSave *Save) error {
 		// Check if this file exists in the base save
 		if baseSave != nil && baseFileMap[file] {
 			// Try to read base content directly or from delta chain
-			baseContent, err := getFileContentFromSave(file, baseSave.Hash)
+			baseContent, err := r.getFileContentFromSave(file, baseSave.Hash)
 			if err != nil {
 				return fmt.Errorf("failed to read base file %s: %w", file, err)
 			}
@@ -215,7 +224,7 @@ func saveFilesAsDelta(files []string, saveHash string, baseSave *Save) error {
 				len(delta.Patches) > 0 &&
 				deltaCounts[file] >= maxDeltaChainLength {
 				// Store full file to avoid excessive delta chain length
-				err = util.SaveFullFile(currentContent, file, saveHash, objectsDir)
+				err = util.SaveFullFile(currentContent, file, saveHash, objectsDir, r.fs)
 				if err != nil {
 					return fmt.Errorf("failed to save full file %s: %w", file, err)
 				}
@@ -226,7 +235,7 @@ func saveFilesAsDelta(files []string, saveHash string, baseSave *Save) error {
 			deltas = append(deltas, delta)
 
 			// Always store full content for new files
-			err = util.SaveFullFile(currentContent, file, saveHash, objectsDir)
+			err = util.SaveFullFile(currentContent, file, saveHash, objectsDir, r.fs)
 			if err != nil {
 				return fmt.Errorf("failed to save full file %s: %w", file, err)
 			}
@@ -243,7 +252,7 @@ func saveFilesAsDelta(files []string, saveHash string, baseSave *Save) error {
 		for _, file := range baseSave.Files {
 			if !currentFileMap[file] {
 				// Get base content
-				baseContent, err := getFileContentFromSave(file, baseSave.Hash)
+				baseContent, err := r.getFileContentFromSave(file, baseSave.Hash)
 				if err != nil {
 					return fmt.Errorf("failed to read base file %s: %w", file, err)
 				}
@@ -261,23 +270,38 @@ func saveFilesAsDelta(files []string, saveHash string, baseSave *Save) error {
 		Deltas:   deltas,
 	}
 
-	return util.SaveDeltaSet(deltaSet, objectsDir)
+	return util.SaveDeltaSet(deltaSet, objectsDir, r.fs)
+}
+
+// saveDeltaSet saves a delta set to the filesystem
+func (r *Repository) saveDeltaSet(deltaSet util.DeltaSet) error {
+	return util.SaveDeltaSet(deltaSet, objectsDir, r.fs)
+}
+
+// loadDeltaSet loads a delta set from the filesystem
+func (r *Repository) loadDeltaSet(saveHash string) (util.DeltaSet, error) {
+	return util.LoadDeltaSet(saveHash, objectsDir, r.fs)
+}
+
+// saveFullFile saves a full file to the objects directory
+func (r *Repository) saveFullFile(content []byte, path, saveHash string) error {
+	return util.SaveFullFile(content, path, saveHash, objectsDir, r.fs)
 }
 
 // getFileContentFromSave retrieves file content from a specific save
-func getFileContentFromSave(file, saveHash string) ([]byte, error) {
+func (r *Repository) getFileContentFromSave(file, saveHash string) ([]byte, error) {
 	if saveHash == "" {
 		return nil, fmt.Errorf("invalid save hash")
 	}
 
 	// Check if the file exists as full content first
-	fullPath := filepath.Join(objectsDir, saveHash+"_"+file)
-	if content, err := os.ReadFile(fullPath); err == nil {
+	content, err := util.GetFileContent(file, saveHash, objectsDir, r.fs)
+	if err == nil {
 		return content, nil
 	}
 
 	// If not found as full content, check for delta
-	metadata, err := loadMetadata()
+	metadata, err := r.loadMetadata()
 	if err != nil {
 		return nil, fmt.Errorf("failed to load metadata: %w", err)
 	}
@@ -296,7 +320,7 @@ func getFileContentFromSave(file, saveHash string) ([]byte, error) {
 	}
 
 	// Load delta set
-	deltaSet, err := util.LoadDeltaSet(saveHash, objectsDir)
+	deltaSet, err := r.loadDeltaSet(saveHash)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load delta set: %w", err)
 	}
@@ -314,13 +338,18 @@ func getFileContentFromSave(file, saveHash string) ([]byte, error) {
 		return nil, fmt.Errorf("delta for file %s not found in save %s", file, saveHash)
 	}
 
+	// Create a wrapper for the method to satisfy the content provider signature
+	contentProvider := func(path, saveHash string) ([]byte, error) {
+		return r.getFileContentFromSave(path, saveHash)
+	}
+
 	// Apply delta using recursive content provider
-	return util.ApplyDelta(*fileDelta, getFileContentFromSave)
+	return util.ApplyDelta(*fileDelta, contentProvider)
 }
 
 // ListSaves returns a list of all saves
-func ListSaves() ([]Save, error) {
-	metadata, err := loadMetadata()
+func (r *Repository) ListSaves() ([]Save, error) {
+	metadata, err := r.loadMetadata()
 	if err != nil {
 		return nil, fmt.Errorf("failed to load metadata: %w", err)
 	}
@@ -329,14 +358,14 @@ func ListSaves() ([]Save, error) {
 }
 
 // Checkout restores the project to the state of the given save hash
-func Checkout(hash string) error {
+func (r *Repository) Checkout(hash string) error {
 	// Check if repository is initialized
-	if _, err := os.Stat(bitDir); os.IsNotExist(err) {
+	if _, err := r.fs.Stat(bitDir); os.IsNotExist(err) {
 		return fmt.Errorf("repository not initialized, run 'bit init' first")
 	}
 
 	// Load metadata
-	metadata, err := loadMetadata()
+	metadata, err := r.loadMetadata()
 	if err != nil {
 		return fmt.Errorf("failed to load metadata: %w", err)
 	}
@@ -358,7 +387,7 @@ func Checkout(hash string) error {
 	currentIgnoredFiles := make(map[string]string) // map of path -> content
 
 	// First, get a list of all current files
-	currentFiles, err := listAllFiles()
+	currentFiles, err := r.listAllFiles()
 	if err != nil {
 		return fmt.Errorf("failed to get current files: %w", err)
 	}
@@ -370,13 +399,13 @@ func Checkout(hash string) error {
 			hasIgnoreFile = true
 
 			// Get the content of the .bitignore file from save
-			ignoreContent, err := getFileContentFromSave(file, hash)
+			ignoreContent, err := r.getFileContentFromSave(file, hash)
 			if err != nil {
 				return fmt.Errorf("failed to get ignore file content: %w", err)
 			}
 
 			// Write the .bitignore file
-			if err := os.WriteFile(file, ignoreContent, 0644); err != nil {
+			if err := r.fs.WriteFile(file, ignoreContent, 0644); err != nil {
 				return fmt.Errorf("failed to restore ignore file: %w", err)
 			}
 			break
@@ -407,7 +436,7 @@ func Checkout(hash string) error {
 
 		if util.IsIgnored(file, ignoredPatterns) {
 			// Read file content
-			content, err := os.ReadFile(file)
+			content, err := r.fs.ReadFile(file)
 			if err == nil {
 				currentIgnoredFiles[file] = string(content)
 			}
@@ -437,7 +466,7 @@ func Checkout(hash string) error {
 
 		// Remove file if not in save
 		if !inSave {
-			if err := os.Remove(file); err != nil && !os.IsNotExist(err) {
+			if err := r.fs.Remove(file); err != nil && !os.IsNotExist(err) {
 				return fmt.Errorf("failed to remove file %s: %w", file, err)
 			}
 		}
@@ -456,19 +485,19 @@ func Checkout(hash string) error {
 		}
 
 		// Get file content from save (either directly or by applying deltas)
-		content, err := getFileContentFromSave(file, hash)
+		content, err := r.getFileContentFromSave(file, hash)
 		if err != nil {
 			return fmt.Errorf("failed to get content for file %s: %w", file, err)
 		}
 
 		// Create parent directories if needed
 		targetDir := filepath.Dir(file)
-		if err := os.MkdirAll(targetDir, 0755); err != nil {
+		if err := r.fs.MkdirAll(targetDir, 0755); err != nil {
 			return fmt.Errorf("failed to create directory %s: %w", targetDir, err)
 		}
 
 		// Write the file
-		if err := os.WriteFile(file, content, 0644); err != nil {
+		if err := r.fs.WriteFile(file, content, 0644); err != nil {
 			return fmt.Errorf("failed to restore file %s: %w", file, err)
 		}
 	}
@@ -477,12 +506,12 @@ func Checkout(hash string) error {
 	for file, content := range currentIgnoredFiles {
 		// Create parent directories if needed
 		targetDir := filepath.Dir(file)
-		if err := os.MkdirAll(targetDir, 0755); err != nil {
+		if err := r.fs.MkdirAll(targetDir, 0755); err != nil {
 			return fmt.Errorf("failed to create directory %s: %w", targetDir, err)
 		}
 
 		// Write file content
-		if err := os.WriteFile(file, []byte(content), 0644); err != nil {
+		if err := r.fs.WriteFile(file, []byte(content), 0644); err != nil {
 			return fmt.Errorf("failed to restore ignored file %s: %w", file, err)
 		}
 	}
@@ -492,7 +521,7 @@ func Checkout(hash string) error {
 
 // Helper functions
 
-func getFilesToSave() ([]string, error) {
+func (r *Repository) getFilesToSave() ([]string, error) {
 	var files []string
 
 	// Load ignore patterns from .bitignore
@@ -502,7 +531,7 @@ func getFilesToSave() ([]string, error) {
 	}
 
 	// Walk through the current directory and add all files
-	err = filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
+	err = r.fs.Walk(".", func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -549,27 +578,19 @@ func createSaveHash(name string, timestamp time.Time, files []string) string {
 	return hex.EncodeToString(h.Sum(nil))[:12] // Use first 12 characters of hash for brevity
 }
 
-func copyFile(src, dst string) error {
-	sourceFile, err := os.Open(src)
+func (r *Repository) copyFile(src, dst string) error {
+	sourceContent, err := r.fs.ReadFile(src)
 	if err != nil {
 		return err
 	}
-	defer sourceFile.Close()
 
-	destFile, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer destFile.Close()
-
-	_, err = io.Copy(destFile, sourceFile)
-	return err
+	return r.fs.WriteFile(dst, sourceContent, 0644)
 }
 
-func loadMetadata() (Metadata, error) {
+func (r *Repository) loadMetadata() (Metadata, error) {
 	var metadata Metadata
 
-	data, err := os.ReadFile(metadataFile)
+	data, err := r.fs.ReadFile(metadataFile)
 	if os.IsNotExist(err) {
 		return Metadata{Saves: []Save{}}, nil
 	} else if err != nil {
@@ -580,21 +601,21 @@ func loadMetadata() (Metadata, error) {
 	return metadata, err
 }
 
-func saveMetadata(metadata Metadata) error {
+func (r *Repository) saveMetadata(metadata Metadata) error {
 	data, err := json.MarshalIndent(metadata, "", "  ")
 	if err != nil {
 		return err
 	}
 
-	return os.WriteFile(metadataFile, data, 0644)
+	return r.fs.WriteFile(metadataFile, data, 0644)
 }
 
 // listAllFiles lists all files in the workspace (including ignored files)
-func listAllFiles() ([]string, error) {
+func (r *Repository) listAllFiles() ([]string, error) {
 	var files []string
 
 	// Walk through the current directory and add all files
-	err := filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
+	err := r.fs.Walk(".", func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -617,4 +638,30 @@ func listAllFiles() ([]string, error) {
 	}
 
 	return files, nil
+}
+
+// Static wrapper functions to maintain backwards compatibility
+
+// InitRepository initializes a new bit repository using the OS filesystem
+func InitRepository() error {
+	repo := NewRepository(util.NewOsFileSystem())
+	return repo.InitRepository()
+}
+
+// SaveState creates a snapshot of the current state with the given name using the OS filesystem
+func SaveState(name string) (string, error) {
+	repo := NewRepository(util.NewOsFileSystem())
+	return repo.SaveState(name)
+}
+
+// ListSaves returns a list of all saves using the OS filesystem
+func ListSaves() ([]Save, error) {
+	repo := NewRepository(util.NewOsFileSystem())
+	return repo.ListSaves()
+}
+
+// Checkout restores the project to the state of the given save hash using the OS filesystem
+func Checkout(hash string) error {
+	repo := NewRepository(util.NewOsFileSystem())
+	return repo.Checkout(hash)
 }

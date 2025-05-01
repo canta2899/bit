@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
 
 	"github.com/sergi/go-diff/diffmatchpatch"
@@ -118,8 +117,8 @@ func ApplyDelta(delta DeltaInfo, baseContentProvider func(path, saveHash string)
 	return resultContent, nil
 }
 
-// SaveDeltaSet stores a set of deltas to disk
-func SaveDeltaSet(deltaSet DeltaSet, objectsDir string) error {
+// SaveDeltaSet stores a set of deltas to disk using the provided filesystem
+func SaveDeltaSet(deltaSet DeltaSet, objectsDir string, fs FileSystem) error {
 	// Create delta file path
 	deltaPath := filepath.Join(objectsDir, "delta_"+deltaSet.SaveHash+".json")
 
@@ -130,22 +129,22 @@ func SaveDeltaSet(deltaSet DeltaSet, objectsDir string) error {
 	}
 
 	// Write to file
-	if err := os.WriteFile(deltaPath, data, 0644); err != nil {
+	if err := fs.WriteFile(deltaPath, data, 0644); err != nil {
 		return fmt.Errorf("failed to write delta file: %w", err)
 	}
 
 	return nil
 }
 
-// LoadDeltaSet loads a set of deltas from disk
-func LoadDeltaSet(saveHash, objectsDir string) (DeltaSet, error) {
+// LoadDeltaSet loads a set of deltas from disk using the provided filesystem
+func LoadDeltaSet(saveHash, objectsDir string, fs FileSystem) (DeltaSet, error) {
 	var deltaSet DeltaSet
 
 	// Create delta file path
 	deltaPath := filepath.Join(objectsDir, "delta_"+saveHash+".json")
 
 	// Read file
-	data, err := os.ReadFile(deltaPath)
+	data, err := fs.ReadFile(deltaPath)
 	if err != nil {
 		return deltaSet, fmt.Errorf("failed to read delta file: %w", err)
 	}
@@ -165,31 +164,31 @@ func calculateFileHash(content []byte) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// CopyToFile copies content to a file, creating directories as needed
-func CopyToFile(content []byte, targetPath string) error {
+// CopyToFile copies content to a file, creating directories as needed using the provided filesystem
+func CopyToFile(content []byte, targetPath string, fs FileSystem) error {
 	// Create parent directories if needed
 	targetDir := filepath.Dir(targetPath)
-	if err := os.MkdirAll(targetDir, 0755); err != nil {
+	if err := fs.MkdirAll(targetDir, 0755); err != nil {
 		return fmt.Errorf("failed to create directory %s: %w", targetDir, err)
 	}
 
 	// Write file
-	return os.WriteFile(targetPath, content, 0644)
+	return fs.WriteFile(targetPath, content, 0644)
 }
 
-// SaveFullFile saves a full copy of the file (for first version)
-func SaveFullFile(content []byte, path, saveHash, objectsDir string) error {
+// SaveFullFile saves a full copy of the file (for first version) using the provided filesystem
+func SaveFullFile(content []byte, path, saveHash, objectsDir string, fs FileSystem) error {
 	fullPath := filepath.Join(objectsDir, saveHash+"_"+path)
-	return CopyToFile(content, fullPath)
+	return CopyToFile(content, fullPath, fs)
 }
 
-// GetFileContent retrieves file content either from working dir or saved object
-func GetFileContent(path, saveHash, objectsDir string) ([]byte, error) {
+// GetFileContent retrieves file content either from working dir or saved object using the provided filesystem
+func GetFileContent(path, saveHash, objectsDir string, fs FileSystem) ([]byte, error) {
 	if saveHash == "" {
 		// Read from working directory
-		return os.ReadFile(path)
+		return fs.ReadFile(path)
 	}
 
 	// Read from objects directory
-	return os.ReadFile(filepath.Join(objectsDir, saveHash+"_"+path))
+	return fs.ReadFile(filepath.Join(objectsDir, saveHash+"_"+path))
 }
